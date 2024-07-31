@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "medicine-assistant"
+version = "0.1.0"
+description = "AI medicine assistant"
+authors = ["Vladimir Maksimov <v.mcsimov@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pandas = "^2.2.2"
+skimpy = "^0.0.15"
+openai = "^1.37.0"
+bs4 = "^0.0.2"
+transformers = "^4.43.2"
+torch = "^2.4.0"
+langchain = "^0.2.11"
+sentence-transformers = "^3.0.1"
+faiss-cpu = "^1.8.0.post1"
+aiogram = "^3.10.0"
+asyncio = "^3.4.3"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
