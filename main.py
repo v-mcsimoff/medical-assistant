@@ -3,17 +3,17 @@ import base64
 import json
 import asyncio
 import aiogram
-from typing import Optional
+import torch
 
+from typing import Optional
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.types import Message
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from transformers.generation.utils import (
     GenerateDecoderOnlyOutput,
     GenerateBeamDecoderOnlyOutput
@@ -37,7 +37,7 @@ BOT_TOKEN = os.getenv('TELEGRAM_TOKEN')
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Model setup
-MEDICAL_ASSISTANT_MODEL = 'McSimoff/llama-3-8b-medical-assistant-v2'
+MEDICAL_ASSISTANT_MODEL = 'McSimoff/llama-3-8b-medical-assistant-v3'
 DEVICE = "cpu"
 model = AutoModelForCausalLM.from_pretrained(
     MEDICAL_ASSISTANT_MODEL
@@ -54,31 +54,28 @@ class LeafletBot:
         self.model = model
         self.tokenizer = tokenizer
         self.client = client
-        self.current_leaflet = None
         self.chat_history = []
+        self.pipe = pipeline(
+            "text-generation",
+            model=self.model,
+            tokenizer=self.tokenizer,
+            torch_dtype=torch.float16,
+            device=DEVICE,
+        )
 
-    async def extract_text(self, image_path: str) -> dict:
-        with open('leaflet_schema.json', 'r') as file:
-            leaflet_schema = json.load(file)
-
+    async def process_leaflet(self, image_path: str) -> str:
         with open(image_path, 'rb') as image_file:
             image_base64 = base64.b64encode(image_file.read()).decode('utf-8')
 
         response = self.client.chat.completions.create(
             model='gpt-4o-mini',
-            response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text", 
-                            "text": """
-                            Provide JSON file that represents this document. 
-                            In the 'leafletText' part provide the whole text 
-                            of the leaflet. Use this JSON Schema: 
-                            """ + json.dumps(leaflet_schema)
-                        },
+                        {"type": "text", "text": """
+                        Extract the text from this image of a medicine leaflet.
+                        """},
                         {
                             "type": "image_url",
                             "image_url": {
@@ -88,186 +85,126 @@ class LeafletBot:
                     ]
                 }
             ],
-            max_tokens=1500,
+            max_tokens=10000,
         )
 
-        return json.loads(response.choices[0].message.content)
-
-    async def create_prompt(
-        self, content: str, is_leaflet: bool
-    ) -> tuple[str, dict]:
-        if is_leaflet:
-            return self._create_prompt_leaflet(content)
-        else:
-            return self._create_prompt_question(content)
-
-    def _create_prompt_leaflet(self, leaflet: dict) -> tuple[str, dict]:
-        system_message = """
-            You are a helpful experienced medical doctor, who helps patients 
-            to take medicine in a right way. You receive a text of a medicine 
-            leaflet and provide a patient with the most important information 
-            about the medicine, including its name, uses, the most important 
-            and wide-spread side effects, prescriptions, and short and simple 
-            instructions to use the medicine.
-        """
-        
-        user_message = """
-        Provide me with brief instructions for use of this medicine: 
-        """
-
-        messages = [
-            {"role": "system", "content": system_message},
-            {
-                "role": "user",
-                "content": user_message + leaflet['properties']['leafletText']
-            }
-        ]
-
+        extracted_text = response.choices[0].message.content
+        self.chat_history = [{
+            "role": "system",
+            "content": f"Leaflet content: {extracted_text}"
+        }]
+        messages = [{
+            "role": "user",
+            "content": f"""
+                You are an experienced medical doctor. I need to understand 
+                how to use medicine. I don't need information about the 
+                leaflet, manufacturer or their contacts, include only 
+                information about the medicine in your response. Provide me 
+                a summary of this medicine leaflet in under 250 words, 
+                including name, uses, from 3 to 6 most important side effects, 
+                and recommendations for taking the medicine - in the morning 
+                or in the evening, before or after eating, interaction with 
+                other medicines or alcohol:
+                {extracted_text}
+            """
+        }]
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True
         )
-
-        encoded_input = self.tokenizer.encode_plus(
+        outputs = self.pipe(
             prompt,
-            add_special_tokens=True,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=512
+            max_new_tokens=350,
+            do_sample=True,
+            temperature=0.5,
+            top_k=50,
+            top_p=0.95
         )
 
-        return prompt, encoded_input
+        summary = outputs[0]["generated_text"]
+        assistant_response = summary.split(
+            '<|im_start|>assistant\n'
+        )[1].split('<|im_end|>')[0].strip()
 
-    def _create_prompt_question(self, question: str) -> tuple[str, dict]:
-        system_message = """
-        You are a helpful experienced medical doctor, who helps patients to 
-        take medicine in a right way. You answer patient's questions about 
-        the medicine from the leaflet that the patient has sent you before. 
-        If there have been several leaflets sent you should use the last one.
-        """
-
-        messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": question}
-        ]
-
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-
-        history = " ".join([f"{role}: {content}" for role, content in self.chat_history])
-        prompt = f"{history} {prompt}"
-
-        encoded_input = self.tokenizer.encode_plus(
-            prompt,
-            add_special_tokens=True,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=512
-        )
-
-        return prompt, encoded_input
-
-    async def model_response(self, prompt: str, encoded_input: dict) -> list[str]:
-        gen_kwargs = {"max_new_tokens": 2, "penalty_alpha": 0.2, "top_k": 2}
-        streamer = TextStreamer(
-            self.tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=True
-        )
-
-        model_output = self.model.generate(
-            encoded_input['input_ids'].to(DEVICE),
-            attention_mask=encoded_input['attention_mask'].to(DEVICE),
-            **gen_kwargs,
-            streamer=streamer,
-        )
-
-        if isinstance(model_output, (
-            GenerateDecoderOnlyOutput,
-            torch.Tensor,
-            GenerateBeamDecoderOnlyOutput
-        )):
-            response_tokens = model_output.sequences if hasattr(
-                model_output,
-                'sequences'
-            ) else model_output
-        else:
-            raise ValueError(
-                f"Unexpected model output type: {type(model_output)}"
-            )
-
-        responses_txt = self.tokenizer.batch_decode(
-            response_tokens[:,len(encoded_input['input_ids'][0]):],
-            skip_special_tokens=True
-        )
-
-        return responses_txt
-
-    async def process_leaflet(self, image_path: str) -> str:
-        try:
-            self.current_leaflet = await self.extract_text(image_path)
-            prompt, encoded_input = await self.create_prompt(
-                self.current_leaflet,
-                is_leaflet=True
-            )
-            response = await self.model_response(prompt, encoded_input)
-            self.chat_history.append(("bot", response[0]))
-            return response[0]
-        except Exception as e:
-            return f"An error occurred while processing the leaflet: {str(e)}"
+        return assistant_response
 
     async def process_question(self, question: str) -> str:
-        if not self.current_leaflet:
-            return "Please send a leaflet image first."
-        try:
-            prompt, encoded_input = await self.create_prompt(
-                question,
-                is_leaflet=False
-            )
-            response = await self.model_response(prompt, encoded_input)
-            self.chat_history.append(("user", question))
-            self.chat_history.append(("bot", response[0]))
-            return response[0]
-        except Exception as e:
-            return f"An error occurred while processing the question: {str(e)}"
+        messages = self.chat_history + [{"role": "user", "content": """
+            You are an experienced medical doctor. I have sent you a medicine 
+            leaflet. I need to undertand how to take the medicine. I have a 
+            question about the medicine from the leaflet. Answer the question 
+            using information from the leaflet. If you don't know the answer, 
+            say that I should ask a doctor. Don't include information about 
+            the leaflet or manufacturer, only the answer to the question. Be 
+            short, but helpful. Question:
+            """ + question}]
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        outputs = self.pipe(
+            prompt,
+            max_new_tokens=150,
+            do_sample=True,
+            temperature=0.5,
+            top_k=50,
+            top_p=0.95
+        )
+        answer = outputs[0]["generated_text"]
+        assitant_answer = answer.split(
+            '<|im_start|>assistant\n'
+        )[1].split('<|im_end|>')[0].strip()
+        return assitant_answer
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
-# storage = MemoryStorage()
-dp = Dispatcher()
-
-dp.include_router(router)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
 
 # Initialize LeafletBot
 leaflet_bot = LeafletBot(model, tokenizer, client)
 
-@router.message(CommandStart())
+@router.message(Command(commands=['start', 'help']))
 async def send_welcome(message: Message, state: FSMContext):
-    await message.reply("Welcome! Please send me a photo of a medicine leaflet to get started.")
+    await message.reply(
+        "Welcome! Please send me a photo of a medicine leaflet to get started."
+    )
     await state.set_state(BotStates.WAITING_FOR_LEAFLET)
 
-@router.message(BotStates.WAITING_FOR_LEAFLET, F.content_type.in_({'photo', 'image'}))
+@router.message(
+    BotStates.WAITING_FOR_LEAFLET,
+    F.content_type.in_({'image', 'photo'})
+)
 async def handle_leaflet(message: Message, state: FSMContext):
     # Download the photo
     photo = message.photo[-1]
     file_id = photo.file_id
     file = await bot.get_file(file_id)
     file_path = file.file_path
-    await bot.download_file(file_path, 'leaflet.jpg')
+
+    local_filename = f"leaflet_{message.from_user.id}.jpg"
+    await bot.download_file(file_path, local_filename)
 
     # Process the leaflet
     await message.reply("Processing the leaflet. This may take a moment...")
-    response = await leaflet_bot.process_leaflet('leaflet.jpg')
-    
-    await message.reply(response)
-    await message.reply("You can now ask questions about this medicine.")
-    await state.set_state(BotStates.READY_FOR_QUESTIONS)
+    try:
+        summary = await leaflet_bot.process_leaflet(local_filename)
+        await message.reply(
+            """
+            Here's a summary of the most important 
+            information from the leaflet:
+            """
+        )
+        await message.reply(summary)
+        await message.reply("You can now ask questions about this medicine.")
+        await state.set_state(BotStates.READY_FOR_QUESTIONS)
+    except Exception as e:
+        await message.reply(
+            f"An error occurred while processing the leaflet: {str(e)}"
+        )
+        await state.set_state(BotStates.WAITING_FOR_LEAFLET)
 
 @router.message(BotStates.READY_FOR_QUESTIONS)
 async def handle_question(message: Message, state: FSMContext):
@@ -275,6 +212,9 @@ async def handle_question(message: Message, state: FSMContext):
     await message.reply("Processing your question. This may take a moment...")
     response = await leaflet_bot.process_question(question)
     await message.reply(response)
+
+# Add the router to the dispatcher
+dp.include_router(router)
 
 async def main():
     # Start the bot
