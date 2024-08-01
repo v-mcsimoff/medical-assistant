@@ -55,6 +55,9 @@ python main.py
 
 5. You can then ask follow-up questions about the medication.
 
+## Bot name for users
+@medicine_leaflet_assistant_bot
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
